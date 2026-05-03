@@ -1,6 +1,6 @@
 #!/bin/bash
 # CVE-2026-41940 IOC + ClamAV Infrastructure Scan
-# Run as root: bash scan.sh [--verbose] [--purge [--yes]]
+# Run as root: bash scan.sh [--verbose] [--purge [--yes]] [--skip 2,5,10]
 
 HOSTNAME=$(hostname)
 DATE=$(date +%Y%m%d_%H%M)
@@ -14,6 +14,61 @@ alert() { echo "[ALERT] $1" | tee -a "$LOG_FILE" | tee -a "$ALERT_FILE"; }
 ok()    { echo "[OK]    $1" | tee -a "$LOG_FILE"; }
 info()  { echo "[INFO]  $1" | tee -a "$LOG_FILE"; }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ARGUMENT PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+SESSIONS_DIR="/var/cpanel/sessions"
+ACCESS_LOG="/usr/local/cpanel/logs/access_log"
+VERBOSE=0
+PURGE=0
+ASSUME_YES=0
+SKIP_SECTIONS=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --verbose)       VERBOSE=1 ;;
+        --purge)         PURGE=1 ;;
+        --yes|-y)        ASSUME_YES=1 ;;
+        --sessions-dir)  SESSIONS_DIR="$2"; shift ;;
+        --access-log)    ACCESS_LOG="$2"; shift ;;
+        --skip)          SKIP_SECTIONS="$2"; shift ;;
+        --help|-h)
+            echo ""
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --verbose              Dump full session file contents on IOC hits"
+            echo "  --purge                Delete compromised session files"
+            echo "  --yes                  Skip purge confirmation (for automated use)"
+            echo "  --skip <sections>      Comma-separated list of sections to skip e.g. --skip 2,7,9"
+            echo "  --sessions-dir <dir>   Override cPanel sessions directory"
+            echo "  --access-log <file>    Override cPanel access log path"
+            echo ""
+            echo "Sections:"
+            echo "  1  cPanel version check"
+            echo "  2  Official cPanel CVE-2026-41940 IOC session scan"
+            echo "  3  Access log exploit signature check"
+            echo "  4  Post-exploitation persistence"
+            echo "  5  Web layer checks"
+            echo "  6  cPanel-specific persistence"
+            echo "  7  System-level checks"
+            echo "  8  Network indicators"
+            echo "  9  Mail / Exim checks"
+            echo "  10 ClamAV malware scan"
+            echo ""
+            exit 0 ;;
+        *)
+            echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# Helper: returns 0 (true) if section number should be skipped
+skip_section() {
+    local num="$1"
+    echo "$SKIP_SECTIONS" | tr ',' '\n' | grep -qx "$num"
+}
+
 log "============================================================================"
 log " Magn8 Infrastructure Security Scan"
 log " Host     : $HOSTNAME"
@@ -25,6 +80,9 @@ log "===========================================================================
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — CVE-2026-41940 CPANEL VERSION CHECK
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 1; then
+    log "[ SKIPPED ] SECTION 1: cPanel Version Check"
+else
 log ""
 log "============================================================================"
 log " SECTION 1: CVE-2026-41940 — cPanel Version Check"
@@ -50,39 +108,19 @@ if command -v /usr/local/cpanel/cpanel &>/dev/null; then
 else
     info "cPanel binary not found at /usr/local/cpanel/cpanel — may not be a cPanel server"
 fi
+fi # end skip_section 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — CVE-2026-41940 OFFICIAL CPANEL IOC SESSION SCAN
-# cPanel official detection script (support.cpanel.net/hc/en-us/articles/
-# 40073787579671) integrated verbatim with output redirected to our log
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 2; then
+    log "[ SKIPPED ] SECTION 2: CVE-2026-41940 IOC Session Scan"
+else
 log ""
 log "============================================================================"
 log " SECTION 2: CVE-2026-41940 — Official cPanel IOC Session File Scan"
 log "============================================================================"
 
-# Default paths (can be overridden with --sessions-dir / --access-log)
-SESSIONS_DIR="/var/cpanel/sessions"
-ACCESS_LOG="/usr/local/cpanel/logs/access_log"
-VERBOSE=0
-PURGE=0
-ASSUME_YES=0
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --verbose)       VERBOSE=1 ;;
-        --purge)         PURGE=1 ;;
-        --yes|-y)        ASSUME_YES=1 ;;
-        --sessions-dir)  SESSIONS_DIR="$2"; shift ;;
-        --access-log)    ACCESS_LOG="$2"; shift ;;
-        --help|-h)
-            echo "Usage: $0 [--verbose] [--purge [--yes]] [--sessions-dir DIR] [--access-log FILE]"
-            exit 0 ;;
-        *)
-            echo "Unknown argument: $1" >&2; exit 1 ;;
-    esac
-    shift
-done
 
 FINDINGS=()
 FINDING_SESSIONS=()
@@ -393,10 +431,14 @@ else
     scan_sessions
     print_cpanel_summary
 fi
+fi # end skip_section 2
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3 — ACCESS LOG EXPLOIT SIGNATURE CHECK
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 3; then
+    log "[ SKIPPED ] SECTION 3: Access Log Exploit Signature Check"
+else
 log ""
 log "============================================================================"
 log " SECTION 3: CVE-2026-41940 — Access Log Exploit Signature Check"
@@ -423,10 +465,14 @@ if [ -f "$CPANEL_LOG" ]; then
 else
     info "cPanel access log not found at $CPANEL_LOG"
 fi
+fi # end skip_section 3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4 — POST-EXPLOITATION PERSISTENCE CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 4; then
+    log "[ SKIPPED ] SECTION 4: Post-Exploitation Persistence Checks"
+else
 log ""
 log "============================================================================"
 log " SECTION 4: Post-Exploitation Persistence Checks"
@@ -482,10 +528,14 @@ log ""
 log "--- /root/.bashrc / .bash_profile Modifications ---"
 ls -la /root/.bashrc /root/.bash_profile /root/.profile 2>/dev/null | tee -a "$LOG_FILE"
 grep -v "^#\|^$" /root/.bashrc 2>/dev/null | tee -a "$LOG_FILE"
+fi # end skip_section 4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — WEB LAYER CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 5; then
+    log "[ SKIPPED ] SECTION 5: Web Layer Infection Vectors"
+else
 log ""
 log "============================================================================"
 log " SECTION 5: Web Layer Infection Vectors"
@@ -539,10 +589,14 @@ find /home /var/www -type f -name "*.php" \
        -o -path "*/tmp/*" \) 2>/dev/null | tee -a "$LOG_FILE" | while read f; do
     alert "PHP file in upload/image/cache directory: $f"
 done
+fi # end skip_section 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 6 — CPANEL-SPECIFIC PERSISTENCE
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 6; then
+    log "[ SKIPPED ] SECTION 6: cPanel-Specific Persistence"
+else
 log ""
 log "============================================================================"
 log " SECTION 6: cPanel-Specific Persistence"
@@ -593,10 +647,14 @@ find /etc/vdomainaliases /home/*/etc/*/aliases 2>/dev/null -type f | while read 
         echo "$EXTERNAL" | tee -a "$LOG_FILE"
     fi
 done
+fi # end skip_section 6
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 7 — SYSTEM-LEVEL CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 7; then
+    log "[ SKIPPED ] SECTION 7: System-Level Checks"
+else
 log ""
 log "============================================================================"
 log " SECTION 7: System-Level Checks"
@@ -694,10 +752,14 @@ if [ -n "$SUSPICIOUS_PROCS" ]; then
 else
     ok "No processes running from /tmp or /dev/shm"
 fi
+fi # end skip_section 7
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8 — NETWORK INDICATORS
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 8; then
+    log "[ SKIPPED ] SECTION 8: Network Indicators"
+else
 log ""
 log "============================================================================"
 log " SECTION 8: Network Indicators"
@@ -724,7 +786,14 @@ if command -v systemd-resolve &>/dev/null; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+fi # end skip_section 8
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 9 — MAIL / EXIM CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+if skip_section 9; then
+    log "[ SKIPPED ] SECTION 9: Mail / Exim Checks"
+else
 # ─────────────────────────────────────────────────────────────────────────────
 log ""
 log "============================================================================"
@@ -761,10 +830,14 @@ if command -v exim &>/dev/null; then
 else
     info "Exim not found on this server"
 fi
+fi # end skip_section 9
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10 — CLAMAV SCAN
 # ─────────────────────────────────────────────────────────────────────────────
+if skip_section 10; then
+    log "[ SKIPPED ] SECTION 10: ClamAV Malware Scan"
+else
 log ""
 log "============================================================================"
 log " SECTION 10: ClamAV Malware Scan"
@@ -832,6 +905,7 @@ if command -v clamscan &>/dev/null; then
         ok "ClamAV: 0 infected files"
     fi
 fi
+fi # end skip_section 10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY

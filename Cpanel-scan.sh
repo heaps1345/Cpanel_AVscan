@@ -484,11 +484,258 @@ ls -la /root/.bashrc /root/.bash_profile /root/.profile 2>/dev/null | tee -a "$L
 grep -v "^#\|^$" /root/.bashrc 2>/dev/null | tee -a "$LOG_FILE"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 5 — CLAMAV SCAN
+# SECTION 5 — WEB LAYER CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 log ""
 log "============================================================================"
-log " SECTION 5: ClamAV Malware Scan"
+log " SECTION 5: Web Layer Infection Vectors"
+log "============================================================================"
+
+log ""
+log "--- Modified .htaccess Files (last 60 days) ---"
+find /home /var/www /usr/local/apache/htdocs -name ".htaccess" \
+    -newer /etc/passwd -ls 2>/dev/null | tee -a "$LOG_FILE"
+
+log ""
+log "--- Suspicious .htaccess Content ---"
+find /home /var/www /usr/local/apache/htdocs -name ".htaccess" 2>/dev/null | while read f; do
+    HITS=$(grep -iE "RewriteRule.*http|php_value auto_prepend|SetHandler.*php|AddType.*php" "$f" 2>/dev/null)
+    if [ -n "$HITS" ]; then
+        alert "Suspicious .htaccess: $f"
+        echo "$HITS" | tee -a "$LOG_FILE"
+    fi
+done
+
+log ""
+log "--- Double Extension / Non-PHP Webshells ---"
+DOUBLE_EXT=$(find /home /var/www /usr/local/apache/htdocs \
+    \( -name "*.php.jpg" -o -name "*.php.png" -o -name "*.php.gif" \
+       -o -name "*.php5" -o -name "*.phtml" -o -name "*.phar" \
+       -o -name "*.shtml" \) 2>/dev/null)
+if [ -n "$DOUBLE_EXT" ]; then
+    alert "Suspicious double-extension or alternate PHP files found:"
+    echo "$DOUBLE_EXT" | tee -a "$LOG_FILE"
+else
+    ok "No double-extension webshell files found"
+fi
+
+log ""
+log "--- Webshell Signatures in JS Files ---"
+JS_HITS=$(find /home /var/www /usr/local/apache/htdocs -name "*.js" 2>/dev/null | \
+    xargs grep -lE "eval\(base64_decode|eval\(unescape|document\.write\(unescape|String\.fromCharCode" \
+    2>/dev/null)
+if [ -n "$JS_HITS" ]; then
+    alert "Suspicious JS files found:"
+    echo "$JS_HITS" | tee -a "$LOG_FILE"
+else
+    ok "No suspicious JS file signatures found"
+fi
+
+log ""
+log "--- CMS Plugin/Upload Directories with PHP Files ---"
+find /home /var/www -type f -name "*.php" \
+    \( -path "*/uploads/*" -o -path "*/wp-content/uploads/*" \
+       -o -path "*/images/*" -o -path "*/cache/*" \
+       -o -path "*/tmp/*" \) 2>/dev/null | tee -a "$LOG_FILE" | while read f; do
+    alert "PHP file in upload/image/cache directory: $f"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — CPANEL-SPECIFIC PERSISTENCE
+# ─────────────────────────────────────────────────────────────────────────────
+log ""
+log "============================================================================"
+log " SECTION 6: cPanel-Specific Persistence"
+log "============================================================================"
+
+log ""
+log "--- WHM Hooks ---"
+if [ -d "/usr/local/cpanel/hooks" ]; then
+    find /usr/local/cpanel/hooks -type f -newer /etc/passwd -ls 2>/dev/null | tee -a "$LOG_FILE"
+    HOOK_COUNT=$(find /usr/local/cpanel/hooks -type f 2>/dev/null | wc -l)
+    info "Total WHM hooks on system: $HOOK_COUNT"
+else
+    info "No WHM hooks directory found"
+fi
+
+log ""
+log "--- cPanel API Tokens (survive password resets) ---"
+API_TOKEN_DIR="/var/cpanel/authn/api_tokens"
+if [ -d "$API_TOKEN_DIR" ]; then
+    find "$API_TOKEN_DIR" -type f 2>/dev/null | while read f; do
+        alert "cPanel API token exists: $f"
+        cat "$f" | tee -a "$LOG_FILE"
+    done
+    TOKEN_COUNT=$(find "$API_TOKEN_DIR" -type f 2>/dev/null | wc -l)
+    if [ "$TOKEN_COUNT" -eq 0 ]; then
+        ok "No cPanel API tokens found"
+    fi
+else
+    ok "No cPanel API token directory found"
+fi
+
+log ""
+log "--- WHM Reseller Accounts ---"
+if [ -f "/etc/resellers" ]; then
+    info "Reseller accounts:"
+    cat /etc/resellers | tee -a "$LOG_FILE"
+else
+    ok "No reseller accounts file"
+fi
+
+log ""
+log "--- cPanel Email Forwarders (exfiltration risk) ---"
+find /etc/vdomainaliases /home/*/etc/*/aliases 2>/dev/null -type f | while read f; do
+    EXTERNAL=$(grep -v "^#\|^$\|@localhost\|127\.0\.0\.1" "$f" 2>/dev/null | \
+        grep -v "@$(hostname)" 2>/dev/null)
+    if [ -n "$EXTERNAL" ]; then
+        alert "External email forwarder in $f:"
+        echo "$EXTERNAL" | tee -a "$LOG_FILE"
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — SYSTEM-LEVEL CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+log ""
+log "============================================================================"
+log " SECTION 7: System-Level Checks"
+log "============================================================================"
+
+log ""
+log "--- SUID/GUID Binaries (non-standard) ---"
+KNOWN_SUID="/bin/su /bin/ping /bin/mount /bin/umount /usr/bin/sudo /usr/bin/passwd \
+    /usr/bin/chsh /usr/bin/chfn /usr/bin/newgrp /usr/bin/gpasswd /sbin/unix_chkpwd"
+find / -perm /4000 -o -perm /2000 2>/dev/null | while read f; do
+    if ! echo "$KNOWN_SUID" | grep -qw "$f"; then
+        alert "Unexpected SUID/GUID binary: $f"
+        ls -la "$f" | tee -a "$LOG_FILE"
+    fi
+done
+
+log ""
+log "--- Loaded Kernel Modules ---"
+lsmod | tee -a "$LOG_FILE"
+# Flag any modules not in a standard path
+for mod in $(lsmod | tail -n +2 | awk '{print $1}'); do
+    modinfo "$mod" 2>/dev/null | grep -q "filename:.*/(lib/modules|kernel)" || \
+        alert "Kernel module with non-standard path: $mod"
+done
+
+log ""
+log "--- Listening Services ---"
+ss -tulpn 2>/dev/null | tee -a "$LOG_FILE"
+# Flag unexpected high ports
+ss -tulpn 2>/dev/null | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | tr -d ':' | \
+    while read port; do
+        if [ "$port" -gt 1024 ] && \
+           ! echo "2082 2083 2086 2087 2095 2096 3306 8080 8443 8888" | grep -qw "$port"; then
+            alert "Unexpected listening port: $port"
+        fi
+    done 2>/dev/null
+
+log ""
+log "--- /etc/passwd Modified Users (last 60 days) ---"
+NEW_USERS=$(find /etc -name "passwd" -newer /etc/group 2>/dev/null)
+if [ -n "$NEW_USERS" ]; then
+    alert "/etc/passwd modified more recently than /etc/group — potential rogue user added"
+    # Show users with shell access
+    grep -vE "nologin|false|sync|halt|shutdown" /etc/passwd | tee -a "$LOG_FILE"
+else
+    ok "/etc/passwd not recently modified"
+fi
+
+log ""
+log "--- /etc/ld.so.preload (LD_PRELOAD rootkit indicator) ---"
+if [ -f "/etc/ld.so.preload" ] && [ -s "/etc/ld.so.preload" ]; then
+    alert "/etc/ld.so.preload exists and is non-empty — possible rootkit:"
+    cat /etc/ld.so.preload | tee -a "$LOG_FILE"
+else
+    ok "/etc/ld.so.preload is empty or absent"
+fi
+
+log ""
+log "--- Processes Running from /tmp or /dev/shm ---"
+SUSPICIOUS_PROCS=$(ls -la /proc/*/exe 2>/dev/null | grep -E "tmp|shm|deleted")
+if [ -n "$SUSPICIOUS_PROCS" ]; then
+    alert "Processes running from suspicious locations:"
+    echo "$SUSPICIOUS_PROCS" | tee -a "$LOG_FILE"
+else
+    ok "No processes running from /tmp or /dev/shm"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — NETWORK INDICATORS
+# ─────────────────────────────────────────────────────────────────────────────
+log ""
+log "============================================================================"
+log " SECTION 8: Network Indicators"
+log "============================================================================"
+
+log ""
+log "--- Established Outbound Connections ---"
+ss -tnp state established 2>/dev/null | tee -a "$LOG_FILE"
+# Flag connections to non-standard ports (potential C2)
+ss -tnp state established 2>/dev/null | awk 'NR>1 {print $4}' | \
+    grep -oE ':[0-9]+$' | tr -d ':' | sort -u | while read port; do
+        if ! echo "80 443 21 22 25 53 110 143 465 587 993 995 3306 2082 2083 2086 2087" | \
+            grep -qw "$port"; then
+            alert "Established outbound connection on unusual port: $port"
+            ss -tnp state established 2>/dev/null | grep ":$port" | tee -a "$LOG_FILE"
+        fi
+    done 2>/dev/null
+
+log ""
+log "--- Recent DNS Queries (if systemd-resolved available) ---"
+if command -v systemd-resolve &>/dev/null; then
+    systemd-resolve --statistics 2>/dev/null | tee -a "$LOG_FILE"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — MAIL / EXIM CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+log ""
+log "============================================================================"
+log " SECTION 9: Mail / Exim Checks"
+log "============================================================================"
+
+log ""
+log "--- Exim Mail Queue Size ---"
+if command -v exim &>/dev/null; then
+    QUEUE=$(exim -bpc 2>/dev/null)
+    info "Exim queue count: $QUEUE"
+    if [ -n "$QUEUE" ] && [ "$QUEUE" -gt 500 ]; then
+        alert "Exim queue has $QUEUE messages — possible spam relay activity"
+    fi
+
+    log ""
+    log "--- Exim Queue Sample (first 20) ---"
+    exim -bp 2>/dev/null | head -40 | tee -a "$LOG_FILE"
+
+    log ""
+    log "--- Exim Mainlog — Top Sending Addresses ---"
+    if [ -f "/var/log/exim_mainlog" ]; then
+        grep "<=.*@" /var/log/exim_mainlog 2>/dev/null | \
+            grep -oE "<= [^ ]+" | sort | uniq -c | sort -rn | head -20 | tee -a "$LOG_FILE"
+    fi
+
+    log ""
+    log "--- Exim Mainlog — Relay Activity ---"
+    if [ -f "/var/log/exim_mainlog" ]; then
+        RELAY_HITS=$(grep -c "relay" /var/log/exim_mainlog 2>/dev/null)
+        info "Total relay log entries: $RELAY_HITS"
+        grep "relay" /var/log/exim_mainlog 2>/dev/null | tail -20 | tee -a "$LOG_FILE"
+    fi
+else
+    info "Exim not found on this server"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 — CLAMAV SCAN
+# ─────────────────────────────────────────────────────────────────────────────
+log ""
+log "============================================================================"
+log " SECTION 10: ClamAV Malware Scan"
 log "============================================================================"
 
 if ! command -v clamscan &>/dev/null; then
@@ -506,7 +753,14 @@ if command -v clamscan &>/dev/null; then
     log "Updating ClamAV signatures..."
     freshclam 2>&1 | tail -5 | tee -a "$LOG_FILE"
 
-    log "Scanning web roots, home directories, tmp..."
+    CLAM_LOG="$LOG_DIR/${HOSTNAME}_clamav_${DATE}.log"
+    SCAN_DIRS="/home /var/www /tmp /var/tmp /dev/shm /usr/local/apache/htdocs"
+
+    log "Scanning: $SCAN_DIRS"
+    log "Progress updates every 30 seconds. This may take several minutes on large servers."
+    log "Infected files will appear immediately if found."
+
+    # Run clamscan in background, writing to log
     clamscan -r \
         --infected \
         --include-pua \
@@ -514,17 +768,38 @@ if command -v clamscan &>/dev/null; then
         --scan-html \
         --scan-pdf \
         --scan-archive \
-        --log="$LOG_DIR/${HOSTNAME}_clamav_${DATE}.log" \
-        /home \
-        /var/www \
-        /tmp \
-        /var/tmp \
-        /dev/shm \
-        /usr/local/apache/htdocs 2>&1 | tee -a "$LOG_FILE"
+        --log="$CLAM_LOG" \
+        $SCAN_DIRS >> "$LOG_FILE" 2>&1 &
 
-    INFECTED=$(grep "Infected files:" "$LOG_DIR/${HOSTNAME}_clamav_${DATE}.log" | awk '{print $NF}')
+    CLAM_PID=$!
+    ELAPSED=0
+
+    # Progress ticker while clamscan runs
+    while kill -0 "$CLAM_PID" 2>/dev/null; do
+        sleep 30
+        ELAPSED=$((ELAPSED + 30))
+        MINS=$((ELAPSED / 60))
+        SECS=$((ELAPSED % 60))
+
+        # Count files scanned so far from the live log
+        SCANNED=$(grep -c "^/" "$CLAM_LOG" 2>/dev/null || echo 0)
+        HITS=$(grep -c "FOUND" "$CLAM_LOG" 2>/dev/null || echo 0)
+
+        printf "[ClamAV] Running... %02dm%02ds elapsed | Files scanned: %s | Hits: %s\n" \
+            "$MINS" "$SECS" "$SCANNED" "$HITS" | tee -a "$LOG_FILE"
+    done
+
+    wait "$CLAM_PID"
+
+    INFECTED=$(grep "Infected files:" "$CLAM_LOG" | awk '{print $NF}')
+    TOTAL=$(grep "Scanned files:" "$CLAM_LOG" | awk '{print $NF}')
+    DATA=$(grep "Data scanned:" "$CLAM_LOG" | awk '{print $3,$4}')
+
+    log "[ClamAV] Complete — Scanned: ${TOTAL} files | Data: ${DATA} | Infected: ${INFECTED}"
+
     if [ "$INFECTED" != "0" ] && [ -n "$INFECTED" ]; then
-        alert "ClamAV found $INFECTED infected file(s) — see $LOG_DIR/${HOSTNAME}_clamav_${DATE}.log"
+        alert "ClamAV found $INFECTED infected file(s) — see $CLAM_LOG"
+        grep "FOUND" "$CLAM_LOG" | tee -a "$ALERT_FILE"
     else
         ok "ClamAV: 0 infected files"
     fi

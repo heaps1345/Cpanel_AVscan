@@ -604,35 +604,66 @@ log "===========================================================================
 
 log ""
 log "--- SUID/GUID Binaries (non-standard) ---"
-KNOWN_SUID="/bin/su /bin/ping /bin/mount /bin/umount /usr/bin/sudo /usr/bin/passwd \
-    /usr/bin/chsh /usr/bin/chfn /usr/bin/newgrp /usr/bin/gpasswd /sbin/unix_chkpwd"
-find / -perm /4000 -o -perm /2000 2>/dev/null | while read f; do
-    if ! echo "$KNOWN_SUID" | grep -qw "$f"; then
-        alert "Unexpected SUID/GUID binary: $f"
-        ls -la "$f" | tee -a "$LOG_FILE"
+# Whitelist covers standard Linux, cPanel, Apache suexec, MySQL PAM, Commvault, Imunify360
+SUID_WHITELIST="
+/bin/su /usr/bin/su /bin/ping /bin/ping6 /usr/bin/ping /usr/bin/ping6
+/bin/mount /bin/umount /usr/bin/mount /usr/bin/umount
+/usr/bin/sudo /usr/bin/passwd /usr/bin/chsh /usr/bin/chfn
+/usr/bin/newgrp /usr/bin/gpasswd /usr/bin/crontab /usr/bin/quota
+/usr/bin/screen /usr/bin/wall /usr/bin/write /usr/bin/ssh-agent
+/usr/sbin/exim /usr/sbin/sendmail /usr/sbin/mount.nfs /usr/sbin/suexec
+/sbin/unix_chkpwd /usr/sbin/unix_chkpwd /usr/sbin/pam_timestamp_check
+/usr/lib/polkit-1/polkit-agent-helper-1 /usr/lib64/polkit-1/polkit-agent-helper-1
+/usr/lib/openssh/ssh-keysign /usr/lib64/openssh/ssh-keysign
+/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+/usr/lib64/mysql/plugin/auth_pam_tool_dir/auth_pam_tool
+/opt/commvault/installer/cvsudo
+/opt/alt/php-internal/var/lib/php/session
+/opt/imunify360/venv/share/imunify360/scripts/send-notifications
+"
+UNEXPECTED_SUID=""
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if ! echo "$SUID_WHITELIST" | grep -qw "$f"; then
+        UNEXPECTED_SUID="$UNEXPECTED_SUID\n$f"
+        ls -la "$f" 2>/dev/null | tee -a "$LOG_FILE"
     fi
-done
+done < <(find / \( -path /proc -o -path /sys \) -prune -o \( -perm /4000 -o -perm /2000 \) -print 2>/dev/null)
+
+if [ -n "$UNEXPECTED_SUID" ]; then
+    alert "Unexpected SUID/GUID binaries found — review above output"
+else
+    ok "No unexpected SUID/GUID binaries found"
+fi
 
 log ""
 log "--- Loaded Kernel Modules ---"
 lsmod | tee -a "$LOG_FILE"
-# Flag any modules not in a standard path
+# Only flag modules with no modinfo at all (unregistered = rootkit indicator)
+# Standard modules all have valid modinfo paths; skip path-matching which false-positives on every module
+UNKNOWN_MODS=""
 for mod in $(lsmod | tail -n +2 | awk '{print $1}'); do
-    modinfo "$mod" 2>/dev/null | grep -q "filename:.*/(lib/modules|kernel)" || \
-        alert "Kernel module with non-standard path: $mod"
+    modinfo "$mod" &>/dev/null || UNKNOWN_MODS="$UNKNOWN_MODS $mod"
 done
+if [ -n "$UNKNOWN_MODS" ]; then
+    alert "Kernel modules with no modinfo (possible rootkit):$UNKNOWN_MODS"
+else
+    ok "All loaded kernel modules have valid modinfo"
+fi
 
 log ""
 log "--- Listening Services ---"
 ss -tulpn 2>/dev/null | tee -a "$LOG_FILE"
-# Flag unexpected high ports
-ss -tulpn 2>/dev/null | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | tr -d ':' | \
+# Whitelist standard + cPanel + mail + Commvault + Dovecot + SpamAssassin ports
+KNOWN_PORTS="20 21 22 25 53 80 110 111 143 161 199 443 465 587 783
+             953 993 995 2020 2077 2078 2079 2080 2082 2083 2086 2087
+             2091 2095 2096 3306 4190 8400 8403 8600 8443 8888"
+ss -tulpn 2>/dev/null | awk 'NR>1 {print $5}' | grep -oE '[0-9]+$' | sort -un | \
     while read port; do
-        if [ "$port" -gt 1024 ] && \
-           ! echo "2082 2083 2086 2087 2095 2096 3306 8080 8443 8888" | grep -qw "$port"; then
-            alert "Unexpected listening port: $port"
+        if ! echo "$KNOWN_PORTS" | grep -qw "$port"; then
+            alert "Unexpected listening port $port — $(ss -tulpn 2>/dev/null | grep ":${port} " | awk '{print $7}' | head -1)"
         fi
-    done 2>/dev/null
+    done
 
 log ""
 log "--- /etc/passwd Modified Users (last 60 days) ---"
@@ -675,15 +706,16 @@ log "===========================================================================
 log ""
 log "--- Established Outbound Connections ---"
 ss -tnp state established 2>/dev/null | tee -a "$LOG_FILE"
-# Flag connections to non-standard ports (potential C2)
-ss -tnp state established 2>/dev/null | awk 'NR>1 {print $4}' | \
-    grep -oE ':[0-9]+$' | tr -d ':' | sort -u | while read port; do
-        if ! echo "80 443 21 22 25 53 110 143 465 587 993 995 3306 2082 2083 2086 2087" | \
-            grep -qw "$port"; then
-            alert "Established outbound connection on unusual port: $port"
-            ss -tnp state established 2>/dev/null | grep ":$port" | tee -a "$LOG_FILE"
-        fi
-    done 2>/dev/null
+# Check remote (peer) port for unusual outbound connections
+# Skip ephemeral/high ports on the LOCAL side — those are normal client ports
+KNOWN_REMOTE_PORTS="22 25 53 80 110 143 443 465 587 993 995 3306 8400 8403 8600"
+ss -tnp state established 2>/dev/null | awk 'NR>1 {print $4, $5, $6}' | while read local peer proc; do
+    remote_port=$(echo "$peer" | grep -oE '[0-9]+$')
+    [ -z "$remote_port" ] && continue
+    if ! echo "$KNOWN_REMOTE_PORTS" | grep -qw "$remote_port"; then
+        alert "Outbound connection to unusual remote port $remote_port | local=$local peer=$peer proc=$proc"
+    fi
+done
 
 log ""
 log "--- Recent DNS Queries (if systemd-resolved available) ---"
@@ -760,33 +792,29 @@ if command -v clamscan &>/dev/null; then
     log "Progress updates every 30 seconds. This may take several minutes on large servers."
     log "Infected files will appear immediately if found."
 
-    # Run clamscan in background, writing to log
+    # Run clamscan in background
+    # --infected omitted so all scanned files appear in log for progress counting
     clamscan -r \
-        --infected \
         --include-pua \
         --scan-ole2 \
         --scan-html \
         --scan-pdf \
         --scan-archive \
         --log="$CLAM_LOG" \
-        $SCAN_DIRS >> "$LOG_FILE" 2>&1 &
+        $SCAN_DIRS 2>&1 &
 
     CLAM_PID=$!
     ELAPSED=0
 
-    # Progress ticker while clamscan runs
     while kill -0 "$CLAM_PID" 2>/dev/null; do
         sleep 30
         ELAPSED=$((ELAPSED + 30))
         MINS=$((ELAPSED / 60))
         SECS=$((ELAPSED % 60))
-
-        # Count files scanned so far from the live log
-        SCANNED=$(grep -c "^/" "$CLAM_LOG" 2>/dev/null || echo 0)
-        HITS=$(grep -c "FOUND" "$CLAM_LOG" 2>/dev/null || echo 0)
-
-        printf "[ClamAV] Running... %02dm%02ds elapsed | Files scanned: %s | Hits: %s\n" \
-            "$MINS" "$SECS" "$SCANNED" "$HITS" | tee -a "$LOG_FILE"
+        SCANNED=$(grep -c "^/" "$CLAM_LOG" 2>/dev/null || echo "0")
+        HITS=$(grep -c "FOUND" "$CLAM_LOG" 2>/dev/null || echo "0")
+        MSG="[ClamAV] Running... ${MINS}m${SECS}s elapsed | Files scanned: ${SCANNED} | Hits: ${HITS}"
+        echo "$MSG" | tee -a "$LOG_FILE"
     done
 
     wait "$CLAM_PID"
